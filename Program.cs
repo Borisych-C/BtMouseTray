@@ -65,6 +65,7 @@ internal sealed class BtMouseTrayApp : IDisposable
 
         // Restore previous settings and preload the initial device list.
         LoadConfig();
+        EnsureConfigExists();
         RefreshDeviceList();
 
         // Create the tray icon and attach the context menu shell object.
@@ -221,6 +222,13 @@ internal sealed class BtMouseTrayApp : IDisposable
             File.WriteAllText(_configPath, json);
         }
         catch { }
+    }
+
+    private void EnsureConfigExists()
+    {
+        // Materialize the config file on first run so users can edit supported settings directly.
+        if (!File.Exists(_configPath))
+            SaveConfig();
     }
 
     private int GetDisplayPercent(string instanceId, int currentPercent)
