@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.userprefs
+
+# IDE and tooling
+.vs/
+.vscode/
+.idea/
+.dotnet-cli/
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
