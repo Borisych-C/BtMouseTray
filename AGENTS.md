@@ -18,6 +18,7 @@ The app:
 - Keep the app Windows-only and compatible with WinForms.
 - Avoid adding dependencies unless there is a clear need.
 - If editing Russian UI strings, make sure the file encoding is correct and the text is not mojibake.
+- When making a commit, always update `CHANGELOG.md` in the same change set.
 
 ## Key Files
 
