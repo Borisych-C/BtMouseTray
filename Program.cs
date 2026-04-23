@@ -429,16 +429,23 @@ internal static class PnpBatteryDevices
     private const uint DIGCF_ALLCLASSES = 0x04;
     private const uint SPDRP_DEVICEDESC = 0x00;
     private const uint SPDRP_FRIENDLYNAME = 0x0C;
+    private const uint SPDRP_SERVICE = 0x04;
+    private const int CR_SUCCESS = 0x00000000;
+    private const uint DN_STARTED = 0x00000008;
+    private const uint DN_DEVICE_DISCONNECTED = 0x02000000;
 
     private static DEVPROPKEY BatteryPercentKey = new(new Guid("104EA319-6EE2-4701-BD47-8DDBF425BBE5"), 2);
 
     public static List<BatteryDevice> GetBatteryDevices(Regex? nameFilter)
     {
-        // Enumerate present devices and keep only BT devices that expose a battery percentage.
+        // Enumerate present devices and keep only BT devices that are currently connected
+        // and expose a battery percentage.
         return WithPresentDeviceInfoSet(
             new List<BatteryDevice>(),
             h =>
             {
+                var presentAudioEndpointNames = GetPresentAudioEndpointNames(h);
+                var audioFamilies = GetBluetoothAudioFamilies(h);
                 var result = new List<BatteryDevice>();
                 uint index = 0;
                 var data = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
@@ -450,7 +457,11 @@ internal static class PnpBatteryDevices
                     if (id == null || !id.StartsWith("BTH", StringComparison.OrdinalIgnoreCase)) continue;
 
                     var name = GetDeviceName(h, ref data);
+                    if (!IsConnected(ref data)) continue;
                     if (nameFilter != null && !nameFilter.IsMatch(name)) continue;
+                    if (audioFamilies.Contains(GetBluetoothBaseName(name)) &&
+                        !HasMatchingAudioEndpoint(name, presentAudioEndpointNames))
+                        continue;
 
                     if (TryReadBatteryPercent(h, ref data, out _))
                         result.Add(new BatteryDevice(id, name));
@@ -516,6 +527,98 @@ internal static class PnpBatteryDevices
         return false;
     }
 
+    private static HashSet<string> GetPresentAudioEndpointNames(IntPtr h)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        uint index = 0;
+        var data = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
+        while (SetupDiEnumDeviceInfo(h, index++, ref data))
+        {
+            var id = GetInstanceId(h, ref data);
+            if (id == null || !id.StartsWith(@"SWD\MMDEVAPI\", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var name = GetDeviceName(h, ref data);
+            if (!string.IsNullOrWhiteSpace(name))
+                result.Add(name);
+        }
+
+        return result;
+    }
+
+    private static bool IsConnected(ref SP_DEVINFO_DATA data)
+    {
+        if (CM_Get_DevNode_Status(out var status, out _, data.DevInst, 0) != CR_SUCCESS)
+            return false;
+
+        return (status & DN_STARTED) != 0 && (status & DN_DEVICE_DISCONNECTED) == 0;
+    }
+
+    private static HashSet<string> GetBluetoothAudioFamilies(IntPtr h)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        uint index = 0;
+        var data = new SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<SP_DEVINFO_DATA>() };
+        while (SetupDiEnumDeviceInfo(h, index++, ref data))
+        {
+            var id = GetInstanceId(h, ref data);
+            if (id == null || !id.StartsWith("BTH", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var name = GetDeviceName(h, ref data);
+            var service = GetRegistryProperty(h, ref data, SPDRP_SERVICE);
+            if (LooksLikeBluetoothAudioFunction(name, service))
+                result.Add(GetBluetoothBaseName(name));
+        }
+
+        return result;
+    }
+
+    private static bool LooksLikeBluetoothAudioFunction(string name, string? service)
+    {
+        if (service != null &&
+            (service.Equals("BthA2dp", StringComparison.OrdinalIgnoreCase) ||
+             service.Equals("BthHFAud", StringComparison.OrdinalIgnoreCase) ||
+             service.Equals("BthHFEnum", StringComparison.OrdinalIgnoreCase) ||
+             service.Equals("Microsoft_Bluetooth_AvrcpTransport", StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        return name.EndsWith(" Stereo", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(" Hands-Free AG", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(" Hands-Free AG Audio", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(" Avrcp Transport", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasMatchingAudioEndpoint(string name, HashSet<string> presentAudioEndpointNames)
+    {
+        var baseName = GetBluetoothBaseName(name);
+        foreach (var endpointName in presentAudioEndpointNames)
+        {
+            if (endpointName.Contains(baseName, StringComparison.OrdinalIgnoreCase) ||
+                baseName.Contains(endpointName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string GetBluetoothBaseName(string name)
+    {
+        foreach (var suffix in new[]
+        {
+            " Hands-Free AG Audio",
+            " Hands-Free AG",
+            " Avrcp Transport",
+            " Stereo"
+        })
+        {
+            if (name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return name[..^suffix.Length].Trim();
+        }
+
+        return name.Trim();
+    }
+
     private static string GetInstanceId(IntPtr h, ref SP_DEVINFO_DATA data)
     {
         // Resolve the stable PnP instance id used for persistence.
@@ -527,15 +630,17 @@ internal static class PnpBatteryDevices
     private static string GetDeviceName(IntPtr h, ref SP_DEVINFO_DATA data)
     {
         // Keep a local helper so the ref parameter is passed explicitly.
-        static string? Read(IntPtr info, ref SP_DEVINFO_DATA d, uint prop)
-        {
-            var buf = new byte[1024];
-            if (!SetupDiGetDeviceRegistryPropertyW(info, ref d, prop, out _, buf, (uint)buf.Length, out var req) || req == 0) return null;
-            return Encoding.Unicode.GetString(buf, 0, (int)req).TrimEnd('\0').Trim();
-        }
-
         // Try the friendly name first, then fall back to the device description.
-        return Read(h, ref data, SPDRP_FRIENDLYNAME) ?? Read(h, ref data, SPDRP_DEVICEDESC) ?? "Unknown";
+        return GetRegistryProperty(h, ref data, SPDRP_FRIENDLYNAME) ?? GetRegistryProperty(h, ref data, SPDRP_DEVICEDESC) ?? "Unknown";
+    }
+
+    private static string? GetRegistryProperty(IntPtr h, ref SP_DEVINFO_DATA data, uint prop)
+    {
+        var buffer = new byte[1024];
+        if (!SetupDiGetDeviceRegistryPropertyW(h, ref data, prop, out _, buffer, (uint)buffer.Length, out var reqSize) || reqSize == 0)
+            return null;
+
+        return Encoding.Unicode.GetString(buffer, 0, (int)reqSize).TrimEnd('\0').Trim();
     }
 
     [StructLayout(LayoutKind.Sequential)] struct SP_DEVINFO_DATA { public uint cbSize; public Guid ClassGuid; public uint DevInst; public IntPtr Reserved; }
@@ -548,6 +653,7 @@ internal static class PnpBatteryDevices
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode)] static extern bool SetupDiGetDeviceInstanceIdW(IntPtr h, ref SP_DEVINFO_DATA data, StringBuilder id, int size, out int req);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode)] static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr h, ref SP_DEVINFO_DATA data, uint prop, out uint type, byte[] buf, uint size, out uint req);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode)] static extern bool SetupDiGetDevicePropertyW(IntPtr h, ref SP_DEVINFO_DATA data, ref DEVPROPKEY key, out uint type, byte[] buf, uint size, out uint req, uint flags);
+    [DllImport("cfgmgr32.dll")] static extern int CM_Get_DevNode_Status(out uint status, out uint problemNumber, uint devInst, uint flags);
 }
 
 internal static class AppLog
